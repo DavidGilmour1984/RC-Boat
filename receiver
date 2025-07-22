@@ -1,0 +1,116 @@
+#include <WiFi.h>
+#include <esp_now.h>
+#include <esp_wifi.h>
+
+// Structure that defines the incoming data format (X and Y pot values)
+typedef struct struct_message {
+  int x;
+  int y;
+} struct_message;
+
+struct_message incomingData;  // Global variable to hold the received data
+
+// Motor A (Y-axis): PWM on GPIO 19, Direction on GPIO 18
+// Motor B (X-axis): PWM on GPIO 5,  Direction on GPIO 4
+const int motorAPWM = 19;
+const int motorADIR = 18;
+const int motorBPWM = 5;
+const int motorBDIR = 4;
+
+// PWM configuration
+const int pwmFreq = 5000;            // PWM frequency in Hz
+const int pwmResolution = 8;         // 8-bit resolution (values 0–255)
+const int maxDuty = 254;             // Cap PWM at 254 to avoid 100% duty glitches
+
+// Filters to prevent jitter and noise
+const int hysteresis = 10;           // Ignore small changes in analog input
+const int pwmThreshold = 5;          // Only update PWM if speed changes significantly
+
+// Track last state to reduce unnecessary updates
+int lastRawY = 2000;
+int lastRawX = 2000;
+int lastPWMA = 0;
+int lastPWMB = 0;
+
+// This function converts the analog input (raw pot value) to motor speed and direction
+void setMotor(int raw, int& lastRaw, int& lastPWM, int pwmPin, int dirPin, int channel, const char* label) {
+  // Hysteresis filter: skip updates if analog input hasn’t changed much
+  if (abs(raw - lastRaw) < hysteresis) return;
+
+  int speed = 0;
+  bool reverse = false;
+
+  // Forward direction mapping (analog value above dead zone)
+  if (raw > 2200) {
+    speed = map(raw, 2201, 4095, 0, maxDuty);  // Farther from center → faster
+    reverse = false;
+  }
+  // Reverse direction mapping (analog value below dead zone)
+  else if (raw < 1600) {
+    speed = map(raw, 1599, 0, maxDuty, 0);     // Closer to 0 → faster reverse
+    reverse = true;
+  }
+  // Dead zone: stop motor
+  else {
+    speed = 0;
+  }
+
+  // Only update if speed changed significantly
+  if (abs(speed - lastPWM) > pwmThreshold || speed == 0) {
+    digitalWrite(dirPin, reverse ? HIGH : LOW);  // Set direction pin
+    ledcWrite(channel, speed);                   // Apply PWM speed
+    lastPWM = speed;
+
+    // Print debug info
+    Serial.printf("%s RAW:%d -> %s | PWM:%d\n", label, raw, reverse ? "REV" : "FWD", speed);
+  }
+
+  lastRaw = raw;  // Save current analog value
+}
+
+// Called automatically whenever a new ESP-NOW packet is received
+void OnDataRecv(const uint8_t * mac, const uint8_t *incomingDataRaw, int len) {
+  memcpy(&incomingData, incomingDataRaw, sizeof(incomingData)); // Copy received data
+
+  // Apply Y-axis to Motor A, X-axis to Motor B
+  setMotor(incomingData.y, lastRawY, lastPWMA, motorAPWM, motorADIR, 0, "Motor A (Y)");
+  setMotor(incomingData.x, lastRawX, lastPWMB, motorBPWM, motorBDIR, 1, "Motor B (X)");
+}
+
+void setup() {
+  Serial.begin(115200);                // Set up serial debugging
+  WiFi.mode(WIFI_STA);                // ESP-NOW must run in station mode
+
+  // Lock both devices to Wi-Fi channel 1 (for reliable ESP-NOW communication)
+  esp_wifi_set_promiscuous(true);
+  esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
+  esp_wifi_set_promiscuous(false);
+
+  // Initialize ESP-NOW
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ESP-NOW init failed");
+    while (true); // Halt here if setup fails
+  }
+
+  // Register the data receive callback function
+  esp_now_register_recv_cb(OnDataRecv);
+
+  // Setup motor direction pins
+  pinMode(motorADIR, OUTPUT);
+  pinMode(motorBDIR, OUTPUT);
+  digitalWrite(motorADIR, LOW);
+  digitalWrite(motorBDIR, LOW);
+
+  // Set up PWM channels
+  ledcSetup(0, pwmFreq, pwmResolution);
+  ledcAttachPin(motorAPWM, 0);  // Motor A
+
+  ledcSetup(1, pwmFreq, pwmResolution);
+  ledcAttachPin(motorBPWM, 1);  // Motor B
+
+  Serial.println("Receiver ready with smooth proportional control");
+}
+
+void loop() {
+  // Nothing needed here — everything happens in the ESP-NOW callback
+}
