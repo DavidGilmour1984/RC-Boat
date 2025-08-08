@@ -1,12 +1,22 @@
 #include <WiFi.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// OLED setup
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET    -1
+#define SCREEN_ADDRESS 0x3C
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
 // Receiver MAC address
 uint8_t receiverAddress[] = {0x34, 0xAB, 0x95, 0x42, 0x47, 0x74}; // Replace with actual MAC
 
 const int VRxPin = 34;  // X-axis
-const int VRyPin = 35;  // Y-axis
+const int VRyPin = 32;  // Y-axis
 
 typedef struct struct_message {
   int x;
@@ -19,12 +29,29 @@ void setup() {
   Serial.begin(115200);
   WiFi.mode(WIFI_STA);
 
+  // OLED init
+  if (!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
+    Serial.println("OLED init failed");
+    while (true);
+  }
+  display.clearDisplay();
+  display.setTextSize(2);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println("Starting...");
+  display.display();
+
+  // ESP-NOW init
   esp_wifi_set_promiscuous(true);
   esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
   esp_wifi_set_promiscuous(false);
 
   if (esp_now_init() != ESP_OK) {
     Serial.println("ESP-NOW init failed");
+    display.clearDisplay();
+    display.setCursor(0, 0);
+    display.println("ESP-NOW Fail");
+    display.display();
     while (true);
   }
 
@@ -34,16 +61,30 @@ void setup() {
   peerInfo.encrypt = false;
   esp_now_add_peer(&peerInfo);
 
-  Serial.println("Transmitter ready");
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.println("Transmitter");
+  display.println("Ready");
+  display.display();
+
+  delay(1000);
 }
 
 void loop() {
   outgoingData.x = analogRead(VRxPin);
   outgoingData.y = analogRead(VRyPin);
 
-  // Debug
-  Serial.printf("X:%d,Y:%d\n", outgoingData.x, outgoingData.y);
-
+  // Send data via ESP-NOW
   esp_now_send(receiverAddress, (uint8_t*)&outgoingData, sizeof(outgoingData));
-  // No delay: send as fast as possible
+
+  // Display values on OLED
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.print("X: ");
+  display.println(outgoingData.x);
+  display.print("Y: ");
+  display.println(outgoingData.y);
+  display.display();
+
+  // No delay to send as fast as possible
 }
