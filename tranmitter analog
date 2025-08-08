@@ -80,9 +80,9 @@ void loop() {
   // Display values on OLED
   display.clearDisplay();
   display.setCursor(0, 0);
-  display.print("X: ");
+  display.print("Right: ");
   display.println(outgoingData.x);
-  display.print("Y: ");
+  display.print("Left: ");
   display.println(outgoingData.y);
   display.display();
 
