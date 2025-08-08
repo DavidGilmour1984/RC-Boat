@@ -41,18 +41,21 @@ void setMotor(int raw, int& lastRaw, int& lastPWM, int pwmPin, int dirPin, int c
   bool reverse = false;
 
   // Forward direction mapping (analog value above dead zone)
-  if (raw > 2200) {
-    speed = map(raw, 2201, 4095, 0, maxDuty);  // Farther from center → faster
+  if (raw > 1780) {
+    // Exponential increase in speed as it moves away from hysteresis zone
+    int duty = map(raw, 1781, 4095, 0, 20);
+    speed = duty * 12 + 1;  // Scale to make it go up to maxDuty
     reverse = false;
   }
   // Reverse direction mapping (analog value below dead zone)
-  else if (raw < 1600) {
-    speed = map(raw, 1599, 0, maxDuty, 0);     // Closer to 0 → faster reverse
+  else if (raw < 1660) {
+    // Max speed at zero, gradually slow down as raw approaches hysteresis threshold (1660)
+    speed = map(raw, 1659, 0, maxDuty, 0);  // Max speed at zero, decreasing as raw increases
     reverse = true;
   }
-  // Dead zone: stop motor
+  // Dead zone: stop motor if raw value is between 1680 and 1780
   else {
-    speed = 0;
+    speed = 0; // Motor stops if raw value is between 1680 and 1780
   }
 
   // Only update if speed changed significantly
@@ -107,6 +110,10 @@ void setup() {
 
   ledcSetup(1, pwmFreq, pwmResolution);
   ledcAttachPin(motorBPWM, 1);  // Motor B
+
+  // Ensure motors are off at startup
+  ledcWrite(0, 0);  // Motor A
+  ledcWrite(1, 0);  // Motor B
 
   Serial.println("Receiver ready with smooth proportional control");
 }
