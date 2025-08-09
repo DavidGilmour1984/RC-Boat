@@ -1,4 +1,3 @@
-
 #include <WiFi.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
@@ -6,86 +5,129 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 
-// OLED setup
+// ======== OLED ========
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
 #define OLED_RESET    -1
 #define SCREEN_ADDRESS 0x3C
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
-// Receiver MAC address
-uint8_t receiverAddress[] = {0x34, 0xAB, 0x95, 0x42, 0x47, 0x74}; // Replace with actual MAC
+// ======== Pins (TX handpiece) ========
+const int VRxPin = 34;  // X pot
+const int VRyPin = 32;  // Y pot
+const int VP_PIN = 36;  // Battery divider sense (VP)
 
-const int VRxPin = 34;  // X-axis
-const int VRyPin = 32;  // Y-axis
+// ======== WiFi / ESP-NOW ========
+const uint8_t RECEIVER_MAC[6] = {0x34, 0xAB, 0x95, 0x42, 0x47, 0x74}; // <--- TODO set to boat MAC
+const uint8_t WIFI_CHANNEL = 1;
 
-typedef struct struct_message {
-  int x;
-  int y;
-} struct_message;
+// ======== Battery calc ========
+const float ADC_REF_V = 3.3f;
+const float DIVIDER_GAIN = 3.0f; // 20k:10k
 
-struct_message outgoingData;
+// ======== Message types ========
+enum MsgKind : uint8_t { MSG_CTRL = 1, MSG_STATUS = 2 };
+
+typedef struct __attribute__((packed)) {
+  uint8_t  kind;       // MSG_CTRL
+  uint16_t x;
+  uint16_t y;
+  uint16_t txBatt_mV;  // our own battery
+} CtrlPacket;
+
+typedef struct __attribute__((packed)) {
+  uint8_t  kind;          // MSG_STATUS
+  uint16_t boatBatt_mV;   // boat battery returned
+} StatusPacket;
+
+// ======== State ========
+volatile uint16_t boatBatt_mV_last = 0;
+
+// ======== Helpers ========
+static inline uint16_t readBattery_mV(int pin) {
+  analogSetPinAttenuation(pin, ADC_11db);
+  int raw = analogRead(pin);
+  float v_pin = (raw / 4095.0f) * ADC_REF_V;
+  float v_bat = v_pin * DIVIDER_GAIN;
+  return (uint16_t)roundf(v_bat * 1000.0f);
+}
+
+void drawOLED(uint16_t txBatt_mV, uint16_t boatBatt_mV, uint16_t x, uint16_t y) {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);            // smaller so it all fits
+
+  // Top line: both voltages
+  display.setCursor(0, 0);
+  display.printf("TX: %.2fV  BOAT: %.2fV\n", txBatt_mV/1000.0f, boatBatt_mV/1000.0f);
+
+  // Controls
+  display.setCursor(0, 16);
+  display.print("Right (X): "); display.println(x);
+  display.print("Left  (Y): "); display.println(y);
+
+  // Hint line
+  display.setCursor(0, 48);
+  display.print("Ch1 locked, sending...");
+  display.display();
+}
+
+// ======== ESP-NOW callbacks ========
+void onDataRecv(const uint8_t*, const uint8_t* data, int len) {
+  if (len < (int)sizeof(StatusPacket)) return;
+  const StatusPacket* pkt = (const StatusPacket*)data;
+  if (pkt->kind != MSG_STATUS) return;
+  boatBatt_mV_last = pkt->boatBatt_mV;
+}
 
 void setup() {
   Serial.begin(115200);
-  WiFi.mode(WIFI_STA);
 
-  // OLED init
+  // OLED
   if (!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
-    Serial.println("OLED init failed");
-    while (true);
+    Serial.println("OLED init failed"); while (true){}
   }
-  display.clearDisplay();
-  display.setTextSize(2);
-  display.setTextColor(SSD1306_WHITE);
-  display.setCursor(0, 0);
-  display.println("Starting...");
-  display.display();
+  display.clearDisplay(); display.setTextSize(1);
+  display.setCursor(0,0); display.println("Starting..."); display.display();
 
-  // ESP-NOW init
+  // WiFi / ESP-NOW
+  WiFi.mode(WIFI_STA);
   esp_wifi_set_promiscuous(true);
-  esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
+  esp_wifi_set_channel(WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
   esp_wifi_set_promiscuous(false);
 
-  if (esp_now_init() != ESP_OK) {
-    Serial.println("ESP-NOW init failed");
-    display.clearDisplay();
-    display.setCursor(0, 0);
-    display.println("ESP-NOW Fail");
-    display.display();
-    while (true);
-  }
+  if (esp_now_init() != ESP_OK) { Serial.println("ESP-NOW init failed"); while (true){} }
+  esp_now_register_recv_cb(onDataRecv);
 
-  esp_now_peer_info_t peerInfo = {};
-  memcpy(peerInfo.peer_addr, receiverAddress, 6);
-  peerInfo.channel = 1;
-  peerInfo.encrypt = false;
-  esp_now_add_peer(&peerInfo);
+  // Add boat as peer to send controls
+  esp_now_peer_info_t peer = {};
+  memcpy(peer.peer_addr, RECEIVER_MAC, 6);
+  peer.channel = WIFI_CHANNEL;
+  peer.encrypt = false;
+  esp_now_add_peer(&peer);
 
   display.clearDisplay();
-  display.setCursor(0, 0);
-  display.println("Transmitter");
-  display.println("Ready");
+  display.setCursor(0,0);
+  display.println("Transmitter Ready");
   display.display();
-
-  delay(1000);
 }
 
 void loop() {
-  outgoingData.x = analogRead(VRxPin);
-  outgoingData.y = analogRead(VRyPin);
+  // Read controls and local battery
+  uint16_t x = analogRead(VRxPin);
+  uint16_t y = analogRead(VRyPin);
+  uint16_t txBatt_mV = readBattery_mV(VP_PIN);
 
-  // Send data via ESP-NOW
-  esp_now_send(receiverAddress, (uint8_t*)&outgoingData, sizeof(outgoingData));
+  // Send control packet continuously (even in dead zone, by design)
+  CtrlPacket c{};
+  c.kind = MSG_CTRL;
+  c.x = x;
+  c.y = y;
+  c.txBatt_mV = txBatt_mV;
+  esp_now_send(RECEIVER_MAC, (uint8_t*)&c, sizeof(c));
 
-  // Display values on OLED
-  display.clearDisplay();
-  display.setCursor(0, 0);
-  display.print("Right: ");
-  display.println(outgoingData.x);
-  display.print("Left: ");
-  display.println(outgoingData.y);
-  display.display();
+  // Update OLED with latest known boat voltage (updated via callback)
+  drawOLED(txBatt_mV, boatBatt_mV_last, x, y);
 
-  // No delay to send as fast as possible
+  // No delay: send as fast as possible
 }
