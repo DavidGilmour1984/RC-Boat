@@ -1,0 +1,145 @@
+#include <WiFi.h>
+#include <esp_now.h>
+#include <esp_wifi.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// ===== OLED =====
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET    -1
+#define SCREEN_ADDRESS 0x3C
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// ===== Pins (TX) =====
+const int VRxPin = 34;  // X pot (ADC1)
+const int VRyPin = 32;  // Y pot (ADC1)
+const int VP_PIN = 36;  // Battery divider VP (ADC1)
+
+// ===== WiFi / NOW =====
+const uint8_t RECEIVER_MAC[6] = {0x34, 0xAB, 0x95, 0x42, 0x47, 0x74}; // <-- set to boat MAC
+const uint8_t WIFI_CHANNEL = 1;
+
+// ===== Battery (TX only on OLED) =====
+const float ADC_REF_V = 3.3f;
+const float DIV_GAIN  = 3.0f; // 20k:10k divider
+
+// ===== Deadband / centers =====
+int centerX = 2048, centerY = 2048;
+const int deadband = 50;   // ±50 around center
+
+// ===== Helpers =====
+static inline uint16_t readBattery_mV(int pin) {
+  analogSetPinAttenuation(pin, ADC_11db);
+  int raw = analogRead(pin);
+  float vpin = (raw / 4095.0f) * ADC_REF_V;
+  float vbat = vpin * DIV_GAIN;
+  return (uint16_t)lroundf(vbat * 1000.0f);
+}
+
+// Map raw ADC to −255..0..+255 with:
+// - raw in (edgeL..edgeH): 0
+// - just above edgeH -> +ve ramp to +255 at 4095
+// - just below edgeL -> −ve ramp to −255 at raw==0
+// - SPECIAL CASE: raw==0 -> −255
+static inline int16_t mapRawToCmd(int raw, int center) {
+  int edgeL = center - deadband;
+  int edgeH = center + deadband;
+
+  if (edgeL < 1) edgeL = 1;
+  if (edgeH > 4094) edgeH = 4094;
+
+  // Special case: hard floor -> full reverse
+  if (raw == 0) return -255;
+
+  // Deadband
+  if (raw >= edgeL && raw <= edgeH) return 0;
+
+  // Above deadband: +0..+255
+  if (raw > edgeH) {
+    int spanHigh = 4095 - edgeH;                 // >=1
+    int num      = raw  - edgeH;                 // 1..spanHigh
+    if (num < 0) num = 0; if (num > spanHigh) num = spanHigh;
+    return (int16_t)(( (long)num * 255L ) / spanHigh);
+  }
+
+  // Below deadband: −0..−255 (0 at edgeL, −255 at raw=0)
+  {
+    int spanLow = edgeL;                          // distance 0..edgeL (>=1)
+    int num     = edgeL - raw;                    // 0 just below edgeL … edgeL at raw=0
+    if (num < 0) num = 0; if (num > spanLow) num = spanLow;
+    int16_t v = (int16_t)(( (long)num * 255L ) / spanLow);
+    return -v;
+  }
+}
+
+// ===== ESP-NOW receive (we don’t use boat data on OLED anymore) =====
+void onDataRecv(const uint8_t*, const uint8_t*, int) {
+  // Intentionally empty: TX ignores RX status for this spec
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  // OLED
+  if (!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) { while (1){} }
+  display.clearDisplay(); display.setTextSize(1);
+  display.setCursor(0,0); display.println("Starting..."); display.display();
+
+  // WiFi / ESP-NOW
+  WiFi.mode(WIFI_STA);
+  esp_wifi_set_promiscuous(true);
+  esp_wifi_set_channel(WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
+  esp_wifi_set_promiscuous(false);
+
+  if (esp_now_init() != ESP_OK) { while (1){} }
+  esp_now_register_recv_cb(onDataRecv);
+
+  esp_now_peer_info_t peer{};
+  memcpy(peer.peer_addr, RECEIVER_MAC, 6);
+  peer.channel = WIFI_CHANNEL;
+  peer.encrypt = false;
+  esp_now_add_peer(&peer);
+
+  // Auto-center (average 32 samples) — keep sticks centered at power up
+  long sx = 0, sy = 0;
+  for (int i = 0; i < 32; i++) { sx += analogRead(VRxPin); sy += analogRead(VRyPin); delay(3); }
+  centerX = sx / 32;
+  centerY = sy / 32;
+
+  // keep centers sane
+  if (centerX < 100) centerX = 100; if (centerX > 3995) centerX = 3995;
+  if (centerY < 100) centerY = 100; if (centerY > 3995) centerY = 3995;
+}
+
+void loop() {
+  // Read sticks
+  uint16_t xraw = analogRead(VRxPin);
+  uint16_t yraw = analogRead(VRyPin);
+
+  // Map to −255..+255
+  int16_t cmdX = mapRawToCmd((int)xraw, centerX);
+  int16_t cmdY = mapRawToCmd((int)yraw, centerY);
+
+  // === SEND CSV ONLY: "cmdX,cmdY" ===
+  char csv[24];
+  // Fits: "-255,-255\0" etc.
+  snprintf(csv, sizeof(csv), "%d,%d", (int)cmdX, (int)cmdY);
+  esp_now_send(RECEIVER_MAC, (uint8_t*)csv, strlen(csv));
+
+  // OLED: TX voltage only (per spec)
+  uint16_t txBatt_mV = readBattery_mV(VP_PIN);
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.printf("TX: %.2fV\n", txBatt_mV/1000.0f);
+  display.setCursor(0, 16);
+  display.printf("cmdX:%4d\n", cmdX);
+  display.printf("cmdY:%4d\n", cmdY);
+  display.display();
+
+  // Optional debug to USB
+  // Serial.printf("TX CSV: %s\n", csv);
+}
