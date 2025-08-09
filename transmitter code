@@ -138,12 +138,12 @@ void loop() {
   uint16_t yraw = analogRead(VRyPin);
 
   // Map to −255..+255
-  int16_t cmdX = mapRawToCmd((int)xraw, centerX);
-  int16_t cmdY = mapRawToCmd((int)yraw, centerY);
+  int16_t cmdR = mapRawToCmd((int)xraw, centerX);
+  int16_t cmdL = mapRawToCmd((int)yraw, centerY);
 
-  // Send CSV "cmdX,cmdY" to boat
+  // Send CSV "cmdR,cmdL" to boat
   char csv[24];
-  snprintf(csv, sizeof(csv), "%d,%d", (int)cmdX, (int)cmdY);
+  snprintf(csv, sizeof(csv), "%d,%d", (int)cmdR, (int)cmdL);
   esp_now_send(RECEIVER_MAC, (uint8_t*)csv, strlen(csv));
 
   // Draw OLED: TX voltage, Boat voltage, RSSI + label, cmds
@@ -172,7 +172,7 @@ void loop() {
   }
 
   display.setCursor(0, 50);
-  display.printf("X:%4d  Y:%4d", cmdX, cmdY);
+  display.printf("L:%4d  R:%4d", cmdL, cmdR);
 
   display.display();
 }
