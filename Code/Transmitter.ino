@@ -19,15 +19,14 @@
 #define SCREEN_ADDRESS 0x3C
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
-// ===== Pin Mapping (Updated) =====
+// ===== Pin Mapping =====
 #define SENSOR_VP   36   // Throttle ADC input
 #define SENSOR_VN   39   // Direction ADC input
 #define VBAT_PIN    34   // Battery voltage sense via 10k:20k divider
-#define LEFT_BTN    25   // Left button (unused for now)
-#define RIGHT_BTN   26   // Right button (unused for now)
+#define LEFT_BTN    25   // Reverse toggle
+#define RIGHT_BTN   26   // (unused)
 
 // ===== WiFi / ESP-NOW =====
-// Boat STA MAC (your boat)
 const uint8_t RECEIVER_MAC[6] = {0x34, 0xAB, 0x95, 0x42, 0x47, 0x74};
 const uint8_t WIFI_CHANNEL = 1;
 
@@ -46,15 +45,6 @@ uint16_t readBattery_mV() {
   float vpin = (raw / 4095.0f) * ADC_REF_V;
   float vbat = vpin * DIV_GAIN;
   return (uint16_t)lroundf(vbat * 1000.0f);
-}
-
-// ===== Convert RSSI (dBm) to a label =====
-static const char* rssiLabel(int rssi) {
-  if (rssi >= -50)      return "Excellent";
-  else if (rssi >= -60) return "Strong";
-  else if (rssi >= -70) return "Moderate";
-  else if (rssi >= -80) return "Weak";
-  else                  return "Very Weak";
 }
 
 // ===== RX callback: boat sends CSV "rssi,boatBatt_mV" =====
@@ -76,6 +66,34 @@ void onDataRecv(const uint8_t* mac, const uint8_t* data, int len) {
   }
 }
 
+// ===== Boot Animation =====
+void boatBootAnimation() {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+
+  // Animate boat once from left to right
+  for (int x = -35; x < SCREEN_WIDTH - 10; x += 4) {
+    display.clearDisplay();
+
+    // Simple, clean boat shape
+    display.setCursor(x, 30);
+    display.println(F("   __/\\__"));
+    display.setCursor(x, 38);
+    display.println(F("~~~\\____/~~~"));
+    display.setCursor(24, 10);
+    display.setTextSize(2);
+    display.println(F("ESP Boat"));
+
+    display.display();
+    delay(60);
+  }
+
+  delay(800);
+  display.clearDisplay();
+  display.display();
+}
+
 // ===== SETUP =====
 void setup() {
   Serial.begin(115200);
@@ -92,12 +110,9 @@ void setup() {
   if (!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
     while (1) {}
   }
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setTextColor(SSD1306_WHITE);
-  display.setCursor(0, 0);
-  display.println("Starting...");
-  display.display();
+
+  // Run boot animation
+  boatBootAnimation();
 
   // WiFi / ESP-NOW setup
   WiFi.mode(WIFI_STA);
@@ -128,24 +143,36 @@ void loop() {
   uint16_t directionRaw = analogRead(SENSOR_VN);
 
   // === Map throttle 0–4095 → 0–255 ===
-int throttle = map(throttleRaw, 0, 4095, 255, 0);
+  int throttle = map(throttleRaw, 0, 4095, 255, 0);
 
   // === Normalize direction to -1.0 .. +1.0 ===
   float centerVN = 2048.0f;
   float turn = (directionRaw - centerVN) / centerVN;
-  if (turn > 1.0f) turn = 1.0f;
-  if (turn < -1.0f) turn = -1.0f;
+  turn = constrain(turn, -1.0f, 1.0f);
+
+  // === Reverse toggle handling ===
+  static bool reverseMode = false;
+  static bool lastButtonState = HIGH;
+  bool buttonState = digitalRead(LEFT_BTN);
+  if (lastButtonState == HIGH && buttonState == LOW) {
+    reverseMode = !reverseMode;
+  }
+  lastButtonState = buttonState;
 
   // === Compute proportional left/right outputs ===
   float leftMotor  = throttle * (1.0f - turn);
   float rightMotor = throttle * (1.0f + turn);
-
-  // Clamp values
   leftMotor  = constrain(leftMotor,  0, 255);
   rightMotor = constrain(rightMotor, 0, 255);
 
   int cmdL = (int)leftMotor;
   int cmdR = (int)rightMotor;
+
+  // === Reverse direction if reverseMode ON (invert polarity + boost) ===
+  if (reverseMode) {
+    cmdL = -constrain(cmdL * 1.3f, -255, 255);  // 30% boost for reverse
+    cmdR = -constrain(cmdR * 1.3f, -255, 255);
+  }
 
   // === Send CSV "cmdL,cmdR" ===
   char csv[24];
@@ -155,34 +182,43 @@ int throttle = map(throttleRaw, 0, 4095, 255, 0);
   // === Read TX battery voltage ===
   uint16_t txBatt_mV = readBattery_mV();
 
-  // === Update OLED display ===
+  // === Calculate link strength as percentage ===
+  int linkPercent = 0;
+  if (lastBoatRSSI != 127) {
+    linkPercent = constrain(map(lastBoatRSSI, -100, -50, 0, 100), 0, 100);
+  }
+
+  // === OLED Display ===
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
   display.setTextSize(1);
 
+  // TX and Boat voltage same row, 1dp
   display.setCursor(0, 0);
-  display.printf("TX:   %.2f V\n", txBatt_mV / 1000.0f);
+  display.printf("TX:%.1fV  Boat:%.1fV\n",
+                 txBatt_mV / 1000.0f,
+                 (lastBoatBatt_mV > 0 ? lastBoatBatt_mV / 1000.0f : 0.0f));
 
+  // RSSI and Link % same row
   display.setCursor(0, 12);
-  if (lastBoatBatt_mV > 0)
-    display.printf("Boat: %.2f V\n", lastBoatBatt_mV / 1000.0f);
+  if (lastBoatRSSI != 127)
+    display.printf("RSSI:%d (%d%%)\n", lastBoatRSSI, linkPercent);
   else
-    display.printf("Boat: --.-- V\n");
+    display.printf("RSSI:-- (--%%)\n");
 
+  // Throttle and direction text
   display.setCursor(0, 24);
-  if (lastBoatRSSI != 127) {
-    display.printf("RSSI: %d dBm\n", lastBoatRSSI);
-    display.setCursor(0, 36);
-    display.printf("Link: %s\n", rssiLabel(lastBoatRSSI));
-  } else {
-    display.printf("RSSI: -- dBm\n");
-    display.setCursor(0, 36);
-    display.printf("Link: --\n");
-  }
+  display.printf("Thr:%3d %s", throttle, reverseMode ? "Reverse" : "Forward");
 
-  display.setCursor(0, 50);
-  display.printf("L:%4d  R:%4d", cmdL, cmdR);
+  // Draw proportional steering bar
+  int barCenter = 64;     // Middle of screen
+  int barWidth = 50;      // Max deflection
+  int barPos = barCenter + (int)(turn * barWidth);
+  int barY = 52;
+  display.drawRect(14, barY - 4, 100, 8, SSD1306_WHITE); // outer box
+  display.fillRect(barPos - 3, barY - 3, 6, 6, SSD1306_WHITE); // indicator dot
+
   display.display();
 
-  delay(50); // small delay for stability
+  delay(50);
 }
